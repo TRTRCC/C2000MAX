@@ -1,0 +1,14 @@
+{
+    "admin/services/fanctrl": {
+        "title": "风扇控制",
+        "order": 80,
+        "action": {
+            "type": "view",
+            "path": "fanctrl"
+        },
+        "depends": {
+            "acl": [ "luci-app-fanctrl" ],
+            "uci": { "fanctrl": true }
+        }
+    }
+}
