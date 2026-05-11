@@ -1,7 +1,7 @@
 #!/bin/sh
 PKG_NAME=luci-app-fanctrl
 DISPLAY_NAME=风扇控制
-PKG_VERSION=1.0.0
+PKG_VERSION=1.0.1
 PKG_ARCH=all
 
 echo "=== Building $PKG_NAME $PKG_VERSION ==="
