@@ -4,7 +4,7 @@ import zlib from 'node:zlib';
 
 const pkgName = 'luci-app-fanctrl';
 const displayName = '风扇控制';
-const version = '1.0.0';
+const version = '1.0.1';
 const arch = 'all';
 const root = path.dirname(new URL(import.meta.url).pathname).replace(/^\/([A-Za-z]:)/, '$1');
 const srcDir = path.join(root, 'src');
