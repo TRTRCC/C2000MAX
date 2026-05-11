@@ -769,6 +769,23 @@ return view.extend({
 			fanSwitchButton.style.color = on ? 'var(--theme-accent-dark)' : '#607d8b';
 			fanSwitchButton.setAttribute('data-on', on ? '1' : '0');
 		}
+
+		function saveCurveForMode(mode) {
+			if (modes.indexOf(mode) < 0) return Promise.resolve();
+			var pts = getCurvePoints(mode);
+			if (!pts || pts.length < 2) return Promise.reject(new Error(_('未读取到该模式的控温曲线')));
+			var temps = pts.map(function(p) { return p.temp; }).join(',');
+			var speeds = pts.map(function(p) { return p.speed; }).join(',');
+			return callSetCurve(mode, temps, speeds).then(function() {
+				loadedCurves[mode] = JSON.parse(JSON.stringify(strategyCurves[mode]));
+			});
+		}
+
+		function applyModeWithCurve(mode) {
+			return saveCurveForMode(mode).then(function() {
+				return callSetMode(mode);
+			});
+		}
 		setActiveMode(currentMode);
 		updateFanSwitchButton(status.gpio, currentMode);
 
@@ -777,17 +794,22 @@ return view.extend({
 			modeCards[mode].addEventListener('click', function() {
 				var previousMode = currentMode;
 				setActiveMode(mode);
-				callSetMode(mode).catch(function(err) {
-					setActiveMode(previousMode);
-					var msg = document.createElement('p');
-					msg.textContent = _('切换模式失败：') + (err.message || err);
-					ui.addNotification(null, msg, 'error');
-				});
 				if (['silent', 'balanced', 'performance', 'custom'].indexOf(mode) >= 0) {
 					presetSelect.value = mode;
 					curvePreset = mode;
 					redrawChart();
 				}
+				applyModeWithCurve(mode).catch(function(err) {
+					setActiveMode(previousMode);
+					if (['silent', 'balanced', 'performance', 'custom'].indexOf(previousMode) >= 0) {
+						presetSelect.value = previousMode;
+						curvePreset = previousMode;
+						redrawChart();
+					}
+					var msg = document.createElement('p');
+					msg.textContent = _('切换模式失败：') + (err.message || err);
+					ui.addNotification(null, msg, 'error');
+				});
 			});
 		});
 
