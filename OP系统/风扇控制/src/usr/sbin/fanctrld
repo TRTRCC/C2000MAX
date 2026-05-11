@@ -1,0 +1,384 @@
+#!/bin/sh
+# fanctrld - Fan Control Daemon for IMM Router
+. /lib/functions.sh
+# Monitors temperatures and controls fan speed based on mode/preset curves
+# with anti-bounce/hysteresis logic
+
+FAN_GPIO="/sys/class/gpio/fan-hw/value"
+FAN_PWM="/sys/bus/platform/devices/pwm-fan/hwmon/hwmon1/pwm1"
+FAN_PWM_ENABLE="/sys/bus/platform/devices/pwm-fan/hwmon/hwmon1/pwm1_enable"
+CPU_TEMP="/sys/class/thermal/thermal_zone0/temp"
+STATUS_FILE="/tmp/fanctrl_status.json"
+FANCONTROL_INIT="/etc/init.d/fancontrol"
+LOG_TAG="fanctrld"
+
+# State
+current_pwm=0
+last_change_time=0
+last_cpu_temp=0
+rising=0
+disabled_restored=0
+
+log_msg() {
+    logger -t "$LOG_TAG" "$1"
+}
+
+# Read UCI config
+config_load fanctrl
+config_get MODE settings mode "balanced"
+config_get MANUAL_PWM settings manual_pwm "128"
+config_get DEBOUNCE_PCT settings debounce_pct "5"
+config_get DEBOUNCE_SEC settings debounce_sec "30"
+config_get HYSTERESIS settings hysteresis "3"
+config_get CURVE_TEMPS_CURVE settings curve ""
+
+# Determine which curve to use
+get_curve() {
+    local mode="$1"
+    config_load fanctrl
+    config_get temps "$mode" temps ""
+    config_get speeds "$mode" speeds ""
+    echo "$temps|$speeds"
+}
+
+# Calculate target PWM percentage from temperature and curve
+calc_target() {
+    local temp="$1"
+    local temps_str="$2"
+    local speeds_str="$3"
+
+    local oIFS="$IFS"
+    IFS=','
+    set -- $temps_str
+    local t_arr=""
+    for t in "$@"; do t_arr="$t_arr $t"; done
+
+    set -- $speeds_str
+    local s_arr=""
+    for s in "$@"; do s_arr="$s_arr $s"; done
+    IFS="$oIFS"
+
+    local t_list=$(echo $t_arr)
+    local s_list=$(echo $s_arr)
+    local t_count=$(echo $t_list | wc -w)
+    local s_count=$(echo $s_list | wc -w)
+
+    if [ "$t_count" -eq 0 ] || [ "$s_count" -eq 0 ] || [ "$t_count" -ne "$s_count" ]; then
+        echo "50"
+        return
+    fi
+
+    # Below lowest temp
+    local first_temp=$(echo $t_list | awk '{print $1}')
+    if [ "$temp" -le "$first_temp" ]; then
+        echo $s_list | awk '{print $1}'
+        return
+    fi
+
+    # Above highest temp
+    local last_temp=$(echo $t_list | awk '{print $NF}')
+    local last_speed=$(echo $s_list | awk '{print $NF}')
+    if [ "$temp" -ge "$last_temp" ]; then
+        echo "$last_speed"
+        return
+    fi
+
+    # Linear interpolation between points
+    local prev_t=""
+    local prev_s=""
+    local i=1
+    for t in $t_list; do
+        local s=$(echo $s_list | awk -v i=$i '{print $i}')
+        if [ "$temp" -le "$t" ]; then
+            if [ -z "$prev_t" ]; then
+                echo "$s"
+                return
+            fi
+            # Interpolate
+            local range_t=$((t - prev_t))
+            local range_s=$((s - prev_s))
+            if [ "$range_t" -eq 0 ]; then
+                echo "$prev_s"
+                return
+            fi
+            local delta=$((temp - prev_t))
+            local result=$((prev_s + (range_s * delta) / range_t))
+            echo "$result"
+            return
+        fi
+        prev_t="$t"
+        prev_s="$s"
+        i=$((i + 1))
+    done
+
+    echo "$last_speed"
+}
+
+# Read CPU temperature (returns in degrees C, integer)
+read_cpu_temp() {
+    local raw
+    raw=$(cat "$CPU_TEMP" 2>/dev/null)
+    if [ -n "$raw" ]; then
+        echo $((raw / 1000))
+    else
+        echo "50"
+    fi
+}
+
+# Read WiFi temperatures via iwpriv (returns "2.4G_temp 5G_temp")
+read_wifi_temp() {
+    local temp1=""
+    local temp2=""
+    if [ -f /sys/class/net/ra0/flags ]; then
+        local flag=$(cat /sys/class/net/ra0/flags 2>/dev/null)
+        if [ "$((flag & 1))" -eq 1 ]; then
+            temp1=$(iwpriv ra0 stat 2>/dev/null | awk '/CurrentTemperature/ {print $3}')
+        fi
+    fi
+    if [ -f /sys/class/net/rai0/flags ]; then
+        local flag=$(cat /sys/class/net/rai0/flags 2>/dev/null)
+        if [ "$((flag & 1))" -eq 1 ]; then
+            temp2=$(iwpriv rai0 stat 2>/dev/null | awk '/CurrentTemperature/ {print $3}')
+        fi
+    fi
+    echo "${temp1:-0} ${temp2:-0}"
+}
+
+# Read 5G module temperature via AT command (with Qmodem compatibility)
+read_5g_temp() {
+    local at_port
+    at_port=$(uci -q get qmodem.2_1.at_port 2>/dev/null)
+    [ -z "$at_port" ] && at_port="/dev/ttyUSB1"
+
+    local response
+    response=$(tom_modem -u -d "$at_port" -o at -c 'AT^CHIPTEMP?' 2>/dev/null | grep '\^CHIPTEMP' | awk -F':' '{print $2}' | awk -F',' '{print $6}')
+
+    if [ -n "$response" ]; then
+        # Value is in 0.1°C, convert to °C
+        echo "$((response / 10))"
+    else
+        echo "0"
+    fi
+}
+
+# Read current fan PWM (0-255)
+read_current_pwm() {
+    local val
+    val=$(cat "$FAN_PWM" 2>/dev/null)
+    echo "${val:-0}"
+}
+
+# Convert percentage (0-100) to PWM value (0-255)
+pct_to_pwm() {
+    local pct="$1"
+    echo $((pct * 255 / 100))
+}
+
+# Convert PWM value (0-255) to percentage (0-100)
+pwm_to_pct() {
+    local pwm="$1"
+    echo $((pwm * 100 / 255))
+}
+
+# Set fan PWM with debounce logic
+# Returns 1 if PWM was changed, 0 if not
+set_fan_pwm() {
+    local target_pct="$1"
+    local now
+    now=$(date +%s)
+
+    local current_pct
+    current_pct=$(pwm_to_pct $(read_current_pwm))
+
+    local diff=$((target_pct - current_pct))
+    [ "$diff" -lt 0 ] && diff=$((-1 * diff))
+
+    local time_diff=$((now - last_change_time))
+    local should_change=0
+
+    if [ "$last_change_time" -eq 0 ]; then
+        should_change=1
+    elif [ "$target_pct" -gt "$current_pct" ] && [ "$rising" -eq 1 ] && [ "$diff" -gt 0 ]; then
+        # Rising temperature is a safety case: speed up without waiting.
+        should_change=1
+    elif [ "$diff" -ge "$DEBOUNCE_PCT" ] && [ "$time_diff" -ge 12 ]; then
+        should_change=1
+    elif [ "$diff" -gt 0 ] && [ "$time_diff" -ge "$DEBOUNCE_SEC" ]; then
+        should_change=1
+    fi
+
+    if [ "$should_change" -eq 1 ]; then
+
+        # Additional hysteresis: don't reduce speed if temperature has only dropped by less than hysteresis degrees
+        if [ "$target_pct" -lt "$current_pct" ]; then
+            local temp_drop=$((last_cpu_temp - $(read_cpu_temp)))
+            if [ "$temp_drop" -lt "$HYSTERESIS" ] && [ "$time_diff" -lt "$((DEBOUNCE_SEC * 2))" ]; then
+                return 0
+            fi
+        fi
+
+        # Ensure PWM is writable
+        local enable_val
+        enable_val=$(cat "$FAN_PWM_ENABLE" 2>/dev/null)
+        if [ "$enable_val" != "1" ]; then
+            echo 1 > "$FAN_PWM_ENABLE" 2>/dev/null
+        fi
+
+        local target_pwm
+        target_pwm=$(pct_to_pwm "$target_pct")
+        # Clamp to valid range
+        [ "$target_pwm" -lt 0 ] && target_pwm=0
+        [ "$target_pwm" -gt 255 ] && target_pwm=255
+        # Minimum PWM to actually spin the fan
+        [ "$target_pct" -gt 0 ] && [ "$target_pwm" -lt 30 ] && target_pwm=30
+
+        if [ "$target_pct" -eq 0 ]; then
+            echo 0 > "$FAN_PWM" 2>/dev/null
+            echo 0 > "$FAN_GPIO" 2>/dev/null
+        else
+            echo 1 > "$FAN_GPIO" 2>/dev/null
+            echo "$target_pwm" > "$FAN_PWM" 2>/dev/null
+        fi
+        current_pwm=$target_pwm
+        last_change_time=$now
+        return 1
+    fi
+
+    return 0
+}
+
+# Kill original fancontrol if it's running
+disable_original_fancontrol() {
+    if [ -x "$FANCONTROL_INIT" ]; then
+        local enabled
+        enabled=$(uci -q get fancontrol.settings.enabled 2>/dev/null)
+        if [ "$enabled" = "1" ]; then
+            uci set fancontrol.settings.enabled='0'
+            uci commit fancontrol
+            "$FANCONTROL_INIT" stop 2>/dev/null
+            "$FANCONTROL_INIT" disable 2>/dev/null
+            log_msg "Disabled original fancontrol and stopped its service"
+        fi
+        # Also kill any running instance
+        local pid
+        pid=$(pidof fancontrol 2>/dev/null)
+        if [ -n "$pid" ]; then
+            kill "$pid" 2>/dev/null
+            log_msg "Killed running fancontrol process (PID: $pid)"
+        fi
+    fi
+}
+
+# Write status JSON file
+write_status() {
+    local mode="$1"
+    local cpu_temp="$2"
+    local wifi_temp1="$3"
+    local wifi_temp2="$4"
+    local temp_5g="$5"
+    local pwm_pct="$6"
+    local state="$7"
+
+    cat > "$STATUS_FILE" <<EOF
+{
+    "mode": "$mode",
+    "cpu_temp": $cpu_temp,
+    "wifi_temp_2g": $wifi_temp1,
+    "wifi_temp_5g": $wifi_temp2,
+    "modem_5g_temp": $temp_5g,
+    "pwm_pct": $pwm_pct,
+    "pwm_raw": $(read_current_pwm),
+    "state": "$state",
+    "gpio": $(cat "$FAN_GPIO" 2>/dev/null || echo 0),
+    "timestamp": $(date +%s)
+}
+EOF
+}
+
+# Main loop
+main_loop() {
+    log_msg "Starting fanctrld, mode=$MODE"
+
+    # Initial setup
+    echo 1 > "$FAN_GPIO" 2>/dev/null
+    echo 1 > "$FAN_PWM_ENABLE" 2>/dev/null
+
+    while true; do
+        # 1. Re-read config (allows live changes)
+        config_load fanctrl
+        config_get ENABLED settings enabled "1"
+        config_get MODE settings mode "balanced"
+        config_get MANUAL_PWM settings manual_pwm "128"
+        config_get DEBOUNCE_PCT settings debounce_pct "5"
+        config_get DEBOUNCE_SEC settings debounce_sec "30"
+        config_get HYSTERESIS settings hysteresis "3"
+
+        # 2. Disable original fancontrol only while this app is enabled.
+        [ "$ENABLED" = "1" ] && disable_original_fancontrol
+
+        # 3. Read temperatures
+        local cpu_temp
+        cpu_temp=$(read_cpu_temp)
+
+        local wifi_temps
+        wifi_temps=$(read_wifi_temp)
+        local wifi_temp_2g=$(echo $wifi_temps | awk '{print $1}')
+        local wifi_temp_5g=$(echo $wifi_temps | awk '{print $2}')
+        local temp_5g
+        temp_5g=$(read_5g_temp)
+
+        # 4. Determine target speed based on mode
+        local target_pct=50
+        local state="auto"
+
+        if [ "$ENABLED" = "1" ]; then
+            disabled_restored=0
+            case "$MODE" in
+                silent|balanced|performance|custom)
+                    local curve_data
+                    curve_data=$(get_curve "$MODE")
+                    local temps_str=$(echo "$curve_data" | awk -F'|' '{print $1}')
+                    local speeds_str=$(echo "$curve_data" | awk -F'|' '{print $2}')
+                    target_pct=$(calc_target "$cpu_temp" "$temps_str" "$speeds_str")
+                    ;;
+                manual)
+                    target_pct=$(pwm_to_pct "$MANUAL_PWM")
+                    state="manual"
+                    ;;
+                off)
+                    target_pct=0
+                    state="off"
+                    ;;
+                *)
+                    target_pct=50
+                    ;;
+            esac
+        else
+            MODE="disabled"
+            state="disabled"
+            target_pct=$(pwm_to_pct $(read_current_pwm))
+            disabled_restored=1
+        fi
+
+        # 5. Apply hysteresis/rising detection
+        if [ "$cpu_temp" -gt "$last_cpu_temp" ]; then
+            rising=1
+        else
+            rising=0
+        fi
+        last_cpu_temp=$cpu_temp
+
+        # 6. Set fan with debounce when enabled
+        [ "$ENABLED" = "1" ] && set_fan_pwm "$target_pct"
+
+        # 7. Write status
+        local current_pct
+        current_pct=$(pwm_to_pct $(read_current_pwm))
+        write_status "$MODE" "$cpu_temp" "$wifi_temp_2g" "$wifi_temp_5g" "$temp_5g" "$current_pct" "$state"
+
+        # 8. Sleep
+        sleep 12
+    done
+}
+
+main_loop
