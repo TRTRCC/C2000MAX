@@ -1,0 +1,439 @@
+#!/bin/sh
+# RPCD backend for luci-app-fanctrl
+
+. /lib/functions.sh
+. /usr/share/libubox/jshn.sh
+
+STATUS_FILE="/tmp/fanctrl_status.json"
+FAN_GPIO="/sys/class/gpio/fan-hw/value"
+FAN_PWM="/sys/bus/platform/devices/pwm-fan/hwmon/hwmon1/pwm1"
+FAN_PWM_ENABLE="/sys/bus/platform/devices/pwm-fan/hwmon/hwmon1/pwm1_enable"
+CPU_TEMP_FILE="/sys/class/thermal/thermal_zone0/temp"
+
+default_temps() {
+    case "$1" in
+        silent) echo "45,55,65,75,85,95" ;;
+        balanced) echo "40,50,60,70,80,90" ;;
+        performance) echo "35,45,55,65,75,85" ;;
+        custom) echo "35,50,65,80,95" ;;
+    esac
+}
+
+default_speeds() {
+    case "$1" in
+        silent) echo "8,15,28,42,62,82" ;;
+        balanced) echo "20,35,52,68,84,100" ;;
+        performance) echo "35,55,70,82,92,100" ;;
+        custom) echo "20,35,55,75,100" ;;
+    esac
+}
+
+list_count() {
+    echo "$1" | awk -F',' '{print NF}'
+}
+
+curve_is_valid() {
+    local temps="$1"
+    local speeds="$2"
+    [ -n "$temps" ] || return 1
+    [ -n "$speeds" ] || return 1
+    [ "$(list_count "$temps")" = "$(list_count "$speeds")" ] || return 1
+    echo "$temps,$speeds" | grep -Eq '^[0-9,]+$' || return 1
+    return 0
+}
+
+ensure_curve() {
+    local mode="$1"
+    local temps speeds
+    temps=$(uci -q get "fanctrl.$mode.temps" 2>/dev/null)
+    speeds=$(uci -q get "fanctrl.$mode.speeds" 2>/dev/null)
+
+    if ! curve_is_valid "$temps" "$speeds"; then
+        uci -q set "fanctrl.$mode=curve"
+        uci -q set "fanctrl.$mode.temps=$(default_temps "$mode")"
+        uci -q set "fanctrl.$mode.speeds=$(default_speeds "$mode")"
+        return 0
+    fi
+    return 1
+}
+
+write_default_curve() {
+    local mode="$1"
+    uci -q set "fanctrl.$mode=curve"
+    uci -q set "fanctrl.$mode.temps=$(default_temps "$mode")"
+    uci -q set "fanctrl.$mode.speeds=$(default_speeds "$mode")"
+}
+
+ensure_config() {
+    local changed=0
+    uci -q get fanctrl.settings >/dev/null 2>&1 || {
+        uci -q set fanctrl.settings=fanctrl
+        changed=1
+    }
+    [ -n "$(uci -q get fanctrl.settings.enabled 2>/dev/null)" ] || {
+        uci -q set fanctrl.settings.enabled='1'
+        changed=1
+    }
+    [ -n "$(uci -q get fanctrl.settings.mode 2>/dev/null)" ] || {
+        uci -q set fanctrl.settings.mode='balanced'
+        changed=1
+    }
+    [ -n "$(uci -q get fanctrl.settings.manual_pwm 2>/dev/null)" ] || {
+        uci -q set fanctrl.settings.manual_pwm='128'
+        changed=1
+    }
+    [ -n "$(uci -q get fanctrl.settings.debounce_pct 2>/dev/null)" ] || {
+        uci -q set fanctrl.settings.debounce_pct='5'
+        changed=1
+    }
+    [ -n "$(uci -q get fanctrl.settings.debounce_sec 2>/dev/null)" ] || {
+        uci -q set fanctrl.settings.debounce_sec='30'
+        changed=1
+    }
+    [ -n "$(uci -q get fanctrl.settings.hysteresis 2>/dev/null)" ] || {
+        uci -q set fanctrl.settings.hysteresis='3'
+        changed=1
+    }
+
+    if [ "$(uci -q get fanctrl.settings.curve_schema_version 2>/dev/null)" != "2" ]; then
+        for m in silent balanced performance custom; do
+            write_default_curve "$m"
+        done
+        changed=1
+    else
+        for m in silent balanced performance custom; do
+            ensure_curve "$m" && changed=1
+        done
+    fi
+
+    if [ "$changed" = "1" ]; then
+        uci -q set fanctrl.settings.curve_schema_version='2'
+        uci commit fanctrl 2>/dev/null
+    fi
+    echo "$changed"
+}
+
+read_cpu_temp() {
+    local raw
+    raw=$(cat "$CPU_TEMP_FILE" 2>/dev/null)
+    if [ -n "$raw" ]; then
+        echo $((raw / 1000))
+    else
+        echo "0"
+    fi
+}
+
+read_pwm_raw() {
+    local val
+    val=$(cat "$FAN_PWM" 2>/dev/null)
+    echo "${val:-0}"
+}
+
+pwm_to_pct() {
+    local pwm="$1"
+    [ -z "$pwm" ] && pwm=0
+    echo $((pwm * 100 / 255))
+}
+
+read_gpio() {
+    local val
+    val=$(cat "$FAN_GPIO" 2>/dev/null)
+    echo "${val:-0}"
+}
+
+read_pwm_enable() {
+    local val
+    val=$(cat "$FAN_PWM_ENABLE" 2>/dev/null)
+    echo "${val:-0}"
+}
+
+read_wifi_temp() {
+    local temp1="0"
+    local temp2="0"
+    if [ -f /sys/class/net/ra0/flags ]; then
+        local flag
+        flag=$(cat /sys/class/net/ra0/flags 2>/dev/null)
+        if [ "$((flag & 1))" -eq 1 ]; then
+            temp1=$(iwpriv ra0 stat 2>/dev/null | awk '/CurrentTemperature/ {print $3; exit}')
+        fi
+    fi
+    if [ -f /sys/class/net/rai0/flags ]; then
+        local flag
+        flag=$(cat /sys/class/net/rai0/flags 2>/dev/null)
+        if [ "$((flag & 1))" -eq 1 ]; then
+            temp2=$(iwpriv rai0 stat 2>/dev/null | awk '/CurrentTemperature/ {print $3; exit}')
+        fi
+    fi
+    echo "${temp1:-0} ${temp2:-0}"
+}
+
+read_5g_temp() {
+    local at_port response
+    at_port=$(uci -q get qmodem.2_1.at_port 2>/dev/null)
+    [ -z "$at_port" ] && at_port="/dev/ttyUSB1"
+    response=$(tom_modem -u -d "$at_port" -o at -c 'AT^CHIPTEMP?' 2>/dev/null | grep '\^CHIPTEMP' | awk -F':' '{print $2}' | awk -F',' '{print $6; exit}')
+    if [ -n "$response" ]; then
+        echo "$((response / 10))"
+    else
+        echo "0"
+    fi
+}
+
+get_status() {
+    config_load fanctrl
+    local enabled mode
+    config_get enabled settings enabled "1"
+    config_get mode settings mode "balanced"
+
+    local cpu_temp pwm_raw pwm_pct gpio pwm_enable wifi_temps wifi_temp_2g wifi_temp_5g modem_5g_temp state timestamp
+    cpu_temp=$(read_cpu_temp)
+    pwm_raw=$(read_pwm_raw)
+    pwm_pct=$(pwm_to_pct "$pwm_raw")
+    gpio=$(read_gpio)
+    pwm_enable=$(read_pwm_enable)
+    wifi_temps=$(read_wifi_temp)
+    wifi_temp_2g=$(echo "$wifi_temps" | awk '{print $1}')
+    wifi_temp_5g=$(echo "$wifi_temps" | awk '{print $2}')
+    modem_5g_temp=$(read_5g_temp)
+    state="live"
+    timestamp=$(date +%s)
+
+    json_init
+    if [ -f "$STATUS_FILE" ]; then
+        local cached_state cached_5g
+        cached_state=$(jsonfilter -e '@.state' "$STATUS_FILE" 2>/dev/null)
+        cached_5g=$(jsonfilter -e '@.modem_5g_temp' "$STATUS_FILE" 2>/dev/null)
+        [ -n "$cached_state" ] && state="$cached_state"
+        [ "$modem_5g_temp" = "0" ] && [ -n "$cached_5g" ] && modem_5g_temp="$cached_5g"
+    fi
+    [ "$enabled" = "1" ] || state="disabled"
+
+    json_add_string "enabled" "$enabled"
+    json_add_string "mode" "$mode"
+    json_add_int "cpu_temp" "${cpu_temp:-0}"
+    json_add_int "wifi_temp_2g" "${wifi_temp_2g:-0}"
+    json_add_int "wifi_temp_5g" "${wifi_temp_5g:-0}"
+    json_add_int "modem_5g_temp" "${modem_5g_temp:-0}"
+    json_add_int "pwm_pct" "${pwm_pct:-0}"
+    json_add_int "pwm_raw" "${pwm_raw:-0}"
+    json_add_int "pwm_enable" "${pwm_enable:-0}"
+    json_add_string "state" "${state:-live}"
+    json_add_int "gpio" "${gpio:-0}"
+    json_add_int "timestamp" "${timestamp:-0}"
+    json_dump
+}
+
+get_config() {
+    local repaired
+    repaired=$(ensure_config)
+
+    json_init
+    if ! config_load fanctrl; then
+        json_add_string "result" "error"
+        json_add_string "message" "Failed to load /etc/config/fanctrl"
+        json_dump
+        return
+    fi
+    local enabled mode manual_pwm debounce_pct debounce_sec hysteresis
+    config_get enabled settings enabled "1"
+    config_get mode settings mode "balanced"
+    config_get manual_pwm settings manual_pwm "128"
+    config_get debounce_pct settings debounce_pct "5"
+    config_get debounce_sec settings debounce_sec "30"
+    config_get hysteresis settings hysteresis "3"
+
+    json_add_string "result" "ok"
+    json_add_string "source" "/etc/config/fanctrl"
+    json_add_string "repaired" "$repaired"
+    json_add_string "enabled" "$enabled"
+    json_add_string "mode" "$mode"
+    json_add_int "manual_pwm" "$manual_pwm"
+    json_add_int "debounce_pct" "$debounce_pct"
+    json_add_int "debounce_sec" "$debounce_sec"
+    json_add_int "hysteresis" "$hysteresis"
+
+    json_add_object "curves"
+    for m in silent balanced performance custom; do
+        local temps speeds
+        config_get temps "$m" temps ""
+        config_get speeds "$m" speeds ""
+        [ -n "$temps" ] || temps=$(uci -q get "fanctrl.$m.temps" 2>/dev/null)
+        [ -n "$speeds" ] || speeds=$(uci -q get "fanctrl.$m.speeds" 2>/dev/null)
+        json_add_object "$m"
+        json_add_string "section" "$m"
+        json_add_string "temps" "$temps"
+        json_add_string "speeds" "$speeds"
+        json_close_object
+    done
+    json_close_object
+    json_dump
+}
+
+set_mode() {
+    local input="$1"
+    local mode=$(echo "$input" | jsonfilter -e '@.mode' 2>/dev/null)
+    [ -z "$mode" ] && mode="$input"
+
+    case "$mode" in
+        silent|balanced|performance|custom|manual|off)
+            uci set fanctrl.settings.mode="$mode"
+            uci commit fanctrl
+            json_init
+            json_add_string "result" "ok"
+            json_add_string "mode" "$mode"
+            json_dump
+            ;;
+        *)
+            json_init
+            json_add_string "result" "error"
+            json_add_string "message" "Invalid mode"
+            json_dump
+            ;;
+    esac
+}
+
+set_manual_pwm() {
+    local input="$1"
+    local pwm=$(echo "$input" | jsonfilter -e '@.pwm' 2>/dev/null)
+    [ -z "$pwm" ] && pwm="$input"
+
+    pwm=$((pwm + 0))
+    [ "$pwm" -lt 0 ] && pwm=0
+    [ "$pwm" -gt 255 ] && pwm=255
+
+    uci set fanctrl.settings.manual_pwm="$pwm"
+    uci commit fanctrl
+
+    json_init
+    json_add_string "result" "ok"
+    json_add_int "pwm" "$pwm"
+    json_dump
+}
+
+set_curve() {
+    local input="$1"
+    local mode=$(echo "$input" | jsonfilter -e '@.mode' 2>/dev/null)
+    local temps=$(echo "$input" | jsonfilter -e '@.temps' 2>/dev/null)
+    local speeds=$(echo "$input" | jsonfilter -e '@.speeds' 2>/dev/null)
+
+    [ -z "$mode" ] || [ -z "$temps" ] || [ -z "$speeds" ] && {
+        json_init
+        json_add_string "result" "error"
+        json_add_string "message" "Missing parameters"
+        json_dump
+        return
+    }
+
+    uci set "fanctrl.$mode.temps=$temps"
+    uci set "fanctrl.$mode.speeds=$speeds"
+    uci commit fanctrl
+
+    json_init
+    json_add_string "result" "ok"
+    json_add_string "mode" "$mode"
+    json_add_string "temps" "$temps"
+    json_add_string "speeds" "$speeds"
+    json_dump
+}
+
+set_enabled() {
+    local input="$1"
+    local enabled=$(echo "$input" | jsonfilter -e '@.enabled' 2>/dev/null)
+    [ -z "$enabled" ] && enabled="$input"
+
+    uci set fanctrl.settings.enabled="$enabled"
+    uci commit fanctrl
+
+    if [ "$enabled" = "1" ]; then
+        /etc/init.d/fanctrl enable 2>/dev/null
+        /etc/init.d/fanctrl start 2>/dev/null
+    else
+        /etc/init.d/fanctrl stop 2>/dev/null
+        /etc/init.d/fanctrl disable 2>/dev/null
+    fi
+
+    json_init
+    json_add_string "result" "ok"
+    json_add_string "enabled" "$enabled"
+    json_dump
+}
+
+set_fan_switch() {
+    local input="$1"
+    local enabled=$(echo "$input" | jsonfilter -e '@.enabled' 2>/dev/null)
+    [ -z "$enabled" ] && enabled="$input"
+
+    if [ "$enabled" = "1" ]; then
+        local mode
+        mode=$(uci -q get fanctrl.settings.mode 2>/dev/null)
+        if [ "$mode" = "off" ] || [ -z "$mode" ]; then
+            uci set fanctrl.settings.mode='balanced'
+        fi
+        uci commit fanctrl
+        echo 1 > "$FAN_GPIO" 2>/dev/null
+        echo 1 > "$FAN_PWM_ENABLE" 2>/dev/null
+        if [ "$(uci -q get fanctrl.settings.enabled 2>/dev/null)" = "1" ]; then
+            /etc/init.d/fanctrl start 2>/dev/null
+        fi
+    else
+        uci set fanctrl.settings.mode='off'
+        uci commit fanctrl
+        echo 1 > "$FAN_PWM_ENABLE" 2>/dev/null
+        echo 0 > "$FAN_PWM" 2>/dev/null
+        echo 0 > "$FAN_GPIO" 2>/dev/null
+    fi
+
+    json_init
+    json_add_string "result" "ok"
+    json_add_string "enabled" "$enabled"
+    json_add_string "mode" "$(uci -q get fanctrl.settings.mode 2>/dev/null)"
+    json_add_int "gpio" "$(cat "$FAN_GPIO" 2>/dev/null || echo 0)"
+    json_dump
+}
+
+get_raw_temps() {
+    local cpu_raw=$(cat "$CPU_TEMP_FILE" 2>/dev/null || echo "0")
+    local cpu_c=$(awk "BEGIN {printf \"%.1f\", $cpu_raw / 1000}")
+    local wifi_temps
+    local temp1="" temp2=""
+
+    if [ -f /sys/class/net/ra0/flags ]; then
+        local flag=$(cat /sys/class/net/ra0/flags 2>/dev/null)
+        if [ "$((flag & 1))" -eq 1 ]; then
+            temp1=$(iwpriv ra0 stat 2>/dev/null | awk '/CurrentTemperature/ {print $3}')
+        fi
+    fi
+    if [ -f /sys/class/net/rai0/flags ]; then
+        local flag=$(cat /sys/class/net/rai0/flags 2>/dev/null)
+        if [ "$((flag & 1))" -eq 1 ]; then
+            temp2=$(iwpriv rai0 stat 2>/dev/null | awk '/CurrentTemperature/ {print $3}')
+        fi
+    fi
+
+    json_init
+    json_add_string "cpu_temp_c" "$cpu_c"
+    json_add_string "wifi_temp_2g" "${temp1:--}"
+    json_add_string "wifi_temp_5g" "${temp2:--}"
+    json_add_int "gpio" "$(cat $FAN_GPIO 2>/dev/null || echo 0)"
+    json_add_int "pwm" "$(cat $FAN_PWM 2>/dev/null || echo 0)"
+    json_add_int "pwm_enable" "$(cat $FAN_PWM_ENABLE 2>/dev/null || echo 0)"
+    json_dump
+}
+
+case "$1" in
+    list)
+        echo '{"get_status":{},"get_config":{},"set_mode":{"mode":"string"},"set_manual_pwm":{"pwm":"integer"},"set_curve":{"mode":"string","temps":"string","speeds":"string"},"set_enabled":{"enabled":"string"},"set_fan_switch":{"enabled":"string"},"get_raw_temps":{}}'
+        ;;
+    call)
+        case "$2" in
+            get_status) get_status ;;
+            get_config) get_config ;;
+            set_mode) read -r input; set_mode "$input" ;;
+            set_manual_pwm) read -r input; set_manual_pwm "$input" ;;
+            set_curve) read -r input; set_curve "$input" ;;
+            set_enabled) read -r input; set_enabled "$input" ;;
+            set_fan_switch) read -r input; set_fan_switch "$input" ;;
+            get_raw_temps) get_raw_temps ;;
+        esac
+        ;;
+esac
