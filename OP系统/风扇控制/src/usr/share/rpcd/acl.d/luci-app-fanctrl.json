@@ -1,0 +1,15 @@
+{
+    "luci-app-fanctrl": {
+        "description": "授予风扇控制访问权限",
+        "read": {
+            "ubus": {
+                "fanctrl": [ "get_status", "get_config", "get_raw_temps" ]
+            }
+        },
+        "write": {
+            "ubus": {
+                "fanctrl": [ "set_mode", "set_manual_pwm", "set_curve", "set_enabled", "set_fan_switch" ]
+            }
+        }
+    }
+}
